@@ -1,0 +1,209 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+# (c) 2014, Patrick McClory <patrick@dualspark.com>
+#
+# This file is part of Ansible
+#
+# Ansible is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Ansible is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+DOCUMENTATION = '''
+---
+module: dict_file
+short_description: Tweak settings in a yaml-formatted configuration file
+description:
+     - Manage (add, remove, change) individual settings in an yaml-style file without having
+       to manage the file as a whole with. Adds missing
+       sections if they don't exist.
+     - Comments are discarded when the source file is read, and therefore will not 
+       show up in the destination file.
+version_added: "1.6"
+options:
+  file_path:
+    description:
+      - Path to the yaml-style file; this file is created if required
+    required: true
+    default: null
+  input_dict:
+    description:
+     - the dictionary to apply to the destination path
+    required: true
+  file_format: 
+    description: 
+     - format of the file to be saved when creating a new file.  
+    choices: ['json', 'yaml']
+    default: 'yaml'
+    required: false 
+  backup:
+    description:
+      - Create a backup file including the timestamp information so you can get
+        the original file back if you somehow clobbered it incorrectly.
+    required: false
+    default: "no"
+    choices: [ "yes", "no" ]
+  crate_path: 
+    description: 
+     - creates paths if they are not fully present (equivalent to mkdir -p)
+    required: false
+    default: "yes"
+    choices: [ "yes", "no" ]
+  state: 
+    description: 
+     - indicates whether input_dict will be added to existing file (present) or their keys will be removed (absent)
+     - specifying "empty" will yield a completely empty dictionary file
+    required: true
+    default: "present"
+    choices: ["present", "absent", "empty"]
+notes:
+   - Straightforward usage pattern to apply-take the file that's there, apply the input_dict, remove remove_keys.
+   - File format detected on read of the inital file or otherwise specified by file_format. 
+   - Output format is the same as the original file and overrides file_format if there's a conflict.
+requirements: [ yaml, json, os, time ]
+author: Patrick McClory
+'''
+
+EXAMPLES = '''
+# Add the contents of the variable (in dictioary format) to the elasticsearch yaml config file
+- dict_file: dest=/etc/elasticsearch/elasticsearch.yml state=present input_dict={{ elasticsearch_config }}
+
+# create a new logstash configuration file in JSON 
+- dict_file: dest=/etc/logstash/conf.d/logstash.conf
+             state=present
+             input_dict={{ logstash_config }}
+             remove_keys={{ logstash_remove_keys }}
+             file_format='json'
+
+# clear out dictionary-formatted file
+- dict_file: dest=/etc/elasticsearch/elasticsearch.yml state=empty
+'''
+
+import yaml
+import json
+import os
+import time
+
+def clean_dict(source_dict, remove_dict):
+  for key in remove_dict:
+    if key in source_dict and isinstance(remove_dict[key], dict):
+      source_dict[key] = clean_dict(source_dict, remove_dict[key])
+    elif key in source_dict: 
+      source_dict.remove(key)
+    else: 
+      # remove key not in source dict.. 
+      pass
+  return source_dict
+
+
+def main():
+
+    module = AnsibleModule(
+        argument_spec = dict(
+            file_path = dict(required=True, type='str'),
+            input_dict = dict(required=True, type='dict'),
+            file_format = dict(required=False, default='yaml', choices=['json', 'yaml']),
+            backup = dict(default='no', type='bool'),   
+            create_path = dict(default=True, type='bool'),      
+            state = dict(default='present', choices=['present', 'absent', 'empty']), 
+            supports_check_mode=True
+        ),
+        add_file_common_args = True
+    )
+
+    file_path = os.path.expanduser(module.params['file_path'])
+    input_dict = module.params.get('input_dict', None)
+    file_format = module.params.get('file_format', 'yaml')
+    backup = module.params.get('backup', True)
+    state = module.params.get('state', 'present')
+    create_path = module.params.get('create_path', True)
+    check_mode = module.params.get('supports_check_node', False)
+
+    if os.path.isfile(file_path): 
+      with open(file_path) as r:
+        src_file_contents = r.read().replace('\n', '')
+
+      format_hint = None
+
+
+      if src_file_contents.startswith('{') or src_file_contents.startswith('['):
+        try:
+          config_dict = json.reads(src_file_contents)
+          format_hint = 'json'
+        except ValueError:
+          module.fail_json(msg='Failed to parse %s as json with ValueError exception.' % (file_path))
+      else:
+        try: 
+          config_dict = yaml.reads(src_file_contents)
+          format_hint = 'yaml'
+        except ValueError:
+          module.fail_json(msg='Failed to parse %s as yaml with ValueError exception.' % (file_path))
+    else: 
+      config_dict = dict()
+
+    if state == 'present':
+      output_dict = config_dict.copy()
+      output_dict.update(input_dict)
+    elif state == 'absent':
+      clean_dict(config_dict, input_dict)
+    elif state == 'empty':
+      output_dict = dict()
+    else: 
+      raise NotImplementedError('State %s is not implemented' % (state))
+
+    if format_hint == None and file_format:
+      format_hint = file_format
+    else:
+      raise module.fail_json(msg='Cannot write output file - output format hints not detected nor set in arguments.')
+
+    if format_hint == 'json':
+      output_string = json.dumps(output_dict)
+    elif format_hint == 'yaml': 
+      output_string = yaml.dumls(output_dict)
+    else:
+      module.fail_json(msg='Dictionary file output hint not set, but file was automatically parsed.')
+
+    md5sum_src = module.md5(src_file_contents)
+    md5sum_dest = module.md5(output_string)
+    backup_file = None
+
+    if check_mode: 
+      if md5sum_src == md5sum_dest:
+        module.exit_json(changed=False)
+      else:
+        module.exit_json(changed=True)
+    else:
+      if md5sum_src == md5sum_dest:
+        changed = False
+      else:
+        changed = True
+        if backup and os.path.exists(file_path):
+          backup_file = module.backup_local(file_path)
+        if not os.path.exists(os.path.dirname(file_path)) and create_path:
+          os.makedirs(os.path.dirname(file_path))
+        with open(file_path, 'w') as f:
+          f.write(output_string)
+
+      file_args = module.load_file_common_arguments(module.params)
+      res_args = dict(file_path = file_path, md5sum = md5sum_src, changed = changed)
+
+      if backup_file:
+          res_args['backup_file'] = backup_file
+
+      res_args['changed'] = module.set_fs_attributes_if_different(file_args, res_args['changed'])
+      module.exit_json(**res_args)
+
+
+# import module snippets
+from ansible.module_utils.basic import *
+main()
